@@ -36,6 +36,8 @@ type StatusManager struct {
 	name    string
 	version string
 
+	statusQueue chan Status
+
 	failing [maxStatusLevel]*configv1.ClusterOperatorStatusCondition
 
 	daemonSets     []types.NamespacedName
@@ -43,24 +45,41 @@ type StatusManager struct {
 	relatedObjects []configv1.ObjectReference
 }
 
+type Status struct {
+	conditions            []configv1.ClusterOperatorStatusCondition
+	reachedAvailableLevel bool
+}
+
 func New(client client.Client, name, version string) *StatusManager {
-	return &StatusManager{client: client, name: name, version: version}
+	statusManager := &StatusManager{client: client, name: name, version: version, statusQueue: make(chan Status, 5)}
+	go statusManager.checkStatus()
+	return statusManager
+}
+
+func (s *StatusManager) checkStatus() {
+	for {
+		select {
+		case status := <-s.statusQueue:
+			s.set(status)
+		}
+	}
 }
 
 // Set updates the ClusterOperator.Status with the provided conditions
-func (status *StatusManager) Set(reachedAvailableLevel bool, conditions ...configv1.ClusterOperatorStatusCondition) {
-	co := &configv1.ClusterOperator{ObjectMeta: metav1.ObjectMeta{Name: status.name}}
-	err := status.client.Get(context.TODO(), types.NamespacedName{Name: status.name}, co)
+func (s *StatusManager) set(status Status) {
+
+	co := &configv1.ClusterOperator{ObjectMeta: metav1.ObjectMeta{Name: s.name}}
+	err := s.client.Get(context.TODO(), types.NamespacedName{Name: s.name}, co)
 	isNotFound := errors.IsNotFound(err)
 	if err != nil && !isNotFound {
-		log.Printf("Failed to get ClusterOperator %q: %v", status.name, err)
+		log.Printf("Failed to get ClusterOperator %q: %v", s.name, err)
 		return
 	}
 
 	oldStatus := co.Status.DeepCopy()
-	co.Status.RelatedObjects = status.relatedObjects
+	co.Status.RelatedObjects = s.relatedObjects
 
-	if reachedAvailableLevel {
+	if status.reachedAvailableLevel {
 		if releaseVersion := os.Getenv("RELEASE_VERSION"); len(releaseVersion) > 0 {
 			co.Status.Versions = []configv1.OperandVersion{
 				{Name: "operator", Version: releaseVersion},
@@ -69,7 +88,7 @@ func (status *StatusManager) Set(reachedAvailableLevel bool, conditions ...confi
 			co.Status.Versions = nil
 		}
 	}
-	for _, condition := range conditions {
+	for _, condition := range status.conditions {
 		v1helpers.SetStatusCondition(&co.Status.Conditions, condition)
 	}
 
@@ -102,13 +121,13 @@ func (status *StatusManager) Set(reachedAvailableLevel bool, conditions ...confi
 		buf = []byte(fmt.Sprintf("(failed to convert to YAML: %s)", err))
 	}
 	if isNotFound {
-		if err := status.client.Create(context.TODO(), co); err != nil {
+		if err := s.client.Create(context.TODO(), co); err != nil {
 			log.Printf("Failed to create ClusterOperator %q: %v", co.Name, err)
 		} else {
 			log.Printf("Created ClusterOperator with conditions:\n%s", string(buf))
 		}
 	} else {
-		err = status.client.Status().Update(context.TODO(), co)
+		err = s.client.Status().Update(context.TODO(), co)
 		if err != nil {
 			log.Printf("Failed to update ClusterOperator %q: %v", co.Name, err)
 		} else {
@@ -118,68 +137,75 @@ func (status *StatusManager) Set(reachedAvailableLevel bool, conditions ...confi
 }
 
 // syncDegraded syncs the current Degraded status
-func (status *StatusManager) syncDegraded() {
-	for _, c := range status.failing {
+func (s *StatusManager) syncDegraded() {
+	for _, c := range s.failing {
 		if c != nil {
-			status.Set(false, *c)
+			s.statusQueue <- Status{
+				reachedAvailableLevel: false,
+				conditions: []configv1.ClusterOperatorStatusCondition{
+					*c,
+				},
+			}
 			return
 		}
 	}
-	status.Set(
-		false,
-		configv1.ClusterOperatorStatusCondition{
-			Type:   configv1.OperatorDegraded,
-			Status: configv1.ConditionFalse,
+	s.statusQueue <- Status{
+		reachedAvailableLevel: false,
+		conditions: []configv1.ClusterOperatorStatusCondition{
+			configv1.ClusterOperatorStatusCondition{
+				Type:   configv1.OperatorDegraded,
+				Status: configv1.ConditionFalse,
+			},
 		},
-	)
+	}
 }
 
 // SetDegraded marks the operator as Degraded with the given reason and message. If it
 // is not already failing for a lower-level reason, the operator's status will be updated.
-func (status *StatusManager) SetDegraded(level StatusLevel, reason, message string) {
-	status.failing[level] = &configv1.ClusterOperatorStatusCondition{
+func (s *StatusManager) SetDegraded(level StatusLevel, reason, message string) {
+	s.failing[level] = &configv1.ClusterOperatorStatusCondition{
 		Type:    configv1.OperatorDegraded,
 		Status:  configv1.ConditionTrue,
 		Reason:  reason,
 		Message: message,
 	}
-	status.syncDegraded()
+	s.syncDegraded()
 }
 
 // SetNotDegraded marks the operator as not Degraded at the given level. If the operator
 // status previously indicated failure at this level, it will updated to show the next
 // higher-level failure, or else to show that the operator is no longer failing.
-func (status *StatusManager) SetNotDegraded(level StatusLevel) {
-	if status.failing[level] != nil {
-		status.failing[level] = nil
+func (s *StatusManager) SetNotDegraded(level StatusLevel) {
+	if s.failing[level] != nil {
+		s.failing[level] = nil
 	}
-	status.syncDegraded()
+	s.syncDegraded()
 }
 
-func (status *StatusManager) SetDaemonSets(daemonSets []types.NamespacedName) {
-	status.daemonSets = daemonSets
+func (s *StatusManager) SetDaemonSets(daemonSets []types.NamespacedName) {
+	s.daemonSets = daemonSets
 }
 
-func (status *StatusManager) SetDeployments(deployments []types.NamespacedName) {
-	status.deployments = deployments
+func (s *StatusManager) SetDeployments(deployments []types.NamespacedName) {
+	s.deployments = deployments
 }
 
-func (status *StatusManager) SetRelatedObjects(relatedObjects []configv1.ObjectReference) {
-	status.relatedObjects = relatedObjects
+func (s *StatusManager) SetRelatedObjects(relatedObjects []configv1.ObjectReference) {
+	s.relatedObjects = relatedObjects
 }
 
 // SetFromPods sets the operator Degraded/Progressing/Available status, based on
 // the current status of the manager's DaemonSets and Deployments.
-func (status *StatusManager) SetFromPods() {
+func (s *StatusManager) SetFromPods() {
 
 	targetLevel := os.Getenv("RELEASE_VERSION")
-	reachedAvailableLevel := (len(status.daemonSets) + len(status.deployments)) > 0
+	reachedAvailableLevel := (len(s.daemonSets) + len(s.deployments)) > 0
 
 	progressing := []string{}
 
-	for _, dsName := range status.daemonSets {
+	for _, dsName := range s.daemonSets {
 		ds := &appsv1.DaemonSet{}
-		if err := status.client.Get(context.TODO(), dsName, ds); err != nil {
+		if err := s.client.Get(context.TODO(), dsName, ds); err != nil {
 			log.Printf("Error getting DaemonSet %q: %v", dsName.String(), err)
 			progressing = append(progressing, fmt.Sprintf("Waiting for DaemonSet %q to be created", dsName.String()))
 			// Assume the OperConfig Controller is in the process of reconciling
@@ -202,9 +228,9 @@ func (status *StatusManager) SetFromPods() {
 		}
 	}
 
-	for _, depName := range status.deployments {
+	for _, depName := range s.deployments {
 		dep := &appsv1.Deployment{}
-		if err := status.client.Get(context.TODO(), depName, dep); err != nil {
+		if err := s.client.Get(context.TODO(), depName, dep); err != nil {
 			log.Printf("Error getting Deployment %q: %v", depName.String(), err)
 			progressing = append(progressing, fmt.Sprintf("Waiting for Deployment %q to be created", depName.String()))
 			// Assume the OperConfig Controller is in the process of reconciling
@@ -225,29 +251,33 @@ func (status *StatusManager) SetFromPods() {
 		}
 	}
 
-	status.SetNotDegraded(PodDeployment)
+	s.SetNotDegraded(PodDeployment)
 
 	if len(progressing) > 0 {
-		status.Set(
-			reachedAvailableLevel,
-			configv1.ClusterOperatorStatusCondition{
-				Type:    configv1.OperatorProgressing,
-				Status:  configv1.ConditionTrue,
-				Reason:  "Deploying",
-				Message: strings.Join(progressing, "\n"),
+		s.statusQueue <- Status{
+			reachedAvailableLevel: reachedAvailableLevel,
+			conditions: []configv1.ClusterOperatorStatusCondition{
+				configv1.ClusterOperatorStatusCondition{
+					Type:    configv1.OperatorProgressing,
+					Status:  configv1.ConditionTrue,
+					Reason:  "Deploying",
+					Message: strings.Join(progressing, "\n"),
+				},
 			},
-		)
+		}
 	} else {
-		status.Set(
-			reachedAvailableLevel,
-			configv1.ClusterOperatorStatusCondition{
-				Type:   configv1.OperatorProgressing,
-				Status: configv1.ConditionFalse,
+		s.statusQueue <- Status{
+			reachedAvailableLevel: reachedAvailableLevel,
+			conditions: []configv1.ClusterOperatorStatusCondition{
+				configv1.ClusterOperatorStatusCondition{
+					Type:   configv1.OperatorProgressing,
+					Status: configv1.ConditionFalse,
+				},
+				configv1.ClusterOperatorStatusCondition{
+					Type:   configv1.OperatorAvailable,
+					Status: configv1.ConditionTrue,
+				},
 			},
-			configv1.ClusterOperatorStatusCondition{
-				Type:   configv1.OperatorAvailable,
-				Status: configv1.ConditionTrue,
-			},
-		)
+		}
 	}
 }

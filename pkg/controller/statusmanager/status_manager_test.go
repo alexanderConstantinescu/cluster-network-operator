@@ -81,8 +81,13 @@ func TestStatusManager_set(t *testing.T) {
 		Reason:  "Reason",
 		Message: "Message",
 	}
-	status.Set(false, condFail)
-
+	status.statusQueue <- Status{
+		reachedAvailableLevel: false,
+		conditions: []configv1.ClusterOperatorStatusCondition{
+			condFail,
+		},
+	}
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -96,8 +101,13 @@ func TestStatusManager_set(t *testing.T) {
 		Type:   configv1.OperatorProgressing,
 		Status: configv1.ConditionUnknown,
 	}
-	status.Set(false, condProgress)
-
+	status.statusQueue <- Status{
+		reachedAvailableLevel: false,
+		conditions: []configv1.ClusterOperatorStatusCondition{
+			condProgress,
+		},
+	}
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -110,8 +120,13 @@ func TestStatusManager_set(t *testing.T) {
 		Type:   configv1.OperatorDegraded,
 		Status: configv1.ConditionFalse,
 	}
-	status.Set(false, condNoFail)
-
+	status.statusQueue <- Status{
+		reachedAvailableLevel: false,
+		conditions: []configv1.ClusterOperatorStatusCondition{
+			condNoFail,
+		},
+	}
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -128,8 +143,15 @@ func TestStatusManager_set(t *testing.T) {
 		Type:   configv1.OperatorAvailable,
 		Status: configv1.ConditionTrue,
 	}
-	status.Set(false, condNoProgress, condAvailable)
 
+	status.statusQueue <- Status{
+		reachedAvailableLevel: false,
+		conditions: []configv1.ClusterOperatorStatusCondition{
+			condNoProgress,
+			condAvailable,
+		},
+	}
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -170,6 +192,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Initial failure status
 	status.SetDegraded(OperatorConfig, "Operator", "")
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -180,6 +204,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Setting a higher-level status should override it
 	status.SetDegraded(ClusterConfig, "Cluster", "")
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -190,6 +216,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Setting a lower-level status should be ignored
 	status.SetDegraded(PodDeployment, "Pods", "")
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -200,6 +228,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Clearing an unseen status should have no effect
 	status.SetNotDegraded(OperatorConfig)
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -210,6 +240,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Clearing the currently-seen status should reveal the higher-level status
 	status.SetNotDegraded(ClusterConfig)
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -220,6 +252,8 @@ func TestStatusManagerSetDegraded(t *testing.T) {
 
 	// Clearing all failing statuses should result in not failing
 	status.SetNotDegraded(PodDeployment)
+	time.Sleep(time.Millisecond * 30)
+
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -239,6 +273,8 @@ func TestStatusManagerSetFromDaemonSets(t *testing.T) {
 	})
 
 	status.SetFromPods()
+	time.Sleep(time.Millisecond * 30)
+
 	co, err := getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -265,6 +301,7 @@ func TestStatusManagerSetFromDaemonSets(t *testing.T) {
 		t.Fatalf("error creating DaemonSet: %v", err)
 	}
 	status.SetFromPods()
+	time.Sleep(time.Millisecond * 30)
 
 	// Since the DaemonSet.Status reports no pods Available, the status should be Progressing
 	co, err = getCO(client, "testing")
@@ -322,6 +359,7 @@ func TestStatusManagerSetFromDaemonSets(t *testing.T) {
 			t.Fatalf("error updating DaemonSet: %v", err)
 		}
 		status.SetFromPods()
+		time.Sleep(time.Millisecond * 30)
 
 		co, err = getCO(client, "testing")
 		if err != nil {
@@ -379,6 +417,7 @@ func TestStatusManagerSetFromDaemonSets(t *testing.T) {
 	}
 	time.Sleep(1 * time.Second) // minimum transition time fidelity
 	status.SetFromPods()
+	time.Sleep(time.Millisecond * 30)
 
 	co, err = getCO(client, "testing")
 	if err != nil {
@@ -425,7 +464,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 	})
 
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err := getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -452,7 +491,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 		t.Fatalf("error creating Deployment: %v", err)
 	}
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -474,7 +513,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 		t.Fatalf("error creating Deployment: %v", err)
 	}
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -510,7 +549,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 		t.Fatalf("error updating Deployment: %v", err)
 	}
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -557,7 +596,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 		t.Fatalf("error creating DaemonSet: %v", err)
 	}
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
@@ -593,7 +632,7 @@ func TestStatusManagerSetFromPods(t *testing.T) {
 		t.Fatalf("error updating Deployment: %v", err)
 	}
 	status.SetFromPods()
-
+	time.Sleep(time.Millisecond * 30)
 	co, err = getCO(client, "testing")
 	if err != nil {
 		t.Fatalf("error getting ClusterOperator: %v", err)
