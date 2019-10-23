@@ -184,11 +184,11 @@ spec:
             --k8s-service-cidr "${OVN_SVC_CIDR}" \
             --k8s-apiserver "{{.K8S_APISERVER}}" \
             --ovn-config-namespace ${ovn_config_namespace} \
-            --nb-address "tcp://${db_ip}:{{.OVN_NB_PORT}}" \
-            --sb-address "tcp://${db_ip}:{{.OVN_SB_PORT}}" \
             --nodeport --gateway-mode local \
             --pidfile /var/run/openvswitch/ovnkube-node.pid \
-            --loglevel "${OVN_KUBE_LOG_LEVEL}" --logfile /dev/stdout
+            --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+            --logfile /dev/stdout \
+            --manage-db-servers
         env:
         - name: OVN_KUBE_LOG_LEVEL
           value: "4"

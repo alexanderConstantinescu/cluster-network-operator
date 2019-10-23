@@ -19,6 +19,7 @@ rules:
   - pods
   - services
   verbs:
+  - patch
   - get
   - list
   - watch
