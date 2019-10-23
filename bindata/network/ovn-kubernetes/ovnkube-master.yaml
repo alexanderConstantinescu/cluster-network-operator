@@ -1,4 +1,4 @@
-kind: Deployment
+kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: ovnkube-master
@@ -8,7 +8,6 @@ metadata:
       This daemonset launches the ovn-kubernetes controller (master) networking components.
     release.openshift.io/version: "{{.ReleaseVersion}}"
 spec:
-  replicas: 1
   selector:
     matchLabels:
       name: ovnkube-master
@@ -38,131 +37,6 @@ spec:
       # /run/openvswitch -> tmpfs - sockets & pids
       # /env -> configmap env-overrides - debug overrides
       containers:
-      # ovn-northd: convert network objects in nbdb to flows in sbdb
-      - name: northd
-        image: {{.OvnImage}}
-        command:
-        - /bin/bash
-        - -c
-        - |
-          set -e
-          if [[ -f /env/_master ]]; then
-            set -o allexport
-            source /env/_master
-            set +o allexport
-          fi
-          exec ovn-northd --no-chdir "-vconsole:${OVN_LOG_LEVEL}" -vfile:off --pidfile=/var/run/openvswitch/ovn-northd.pid
-        env:
-        - name: OVN_LOG_LEVEL
-          value: info
-        volumeMounts:
-        - mountPath: /etc/openvswitch/
-          name: etc-openvswitch
-        - mountPath: /var/lib/openvswitch/
-          name: var-lib-openvswitch
-        - mountPath: /run/openvswitch/
-          name: run-openvswitch
-        - mountPath: /env
-          name: env-overrides
-        resources:
-          requests:
-            cpu: 100m
-            memory: 300Mi
-
-      # nbdb: the northbound, or logical network object DB
-      - name: nbdb
-        image: {{.OvnImage}}
-        command:
-        - /bin/bash
-        - -c
-        - |
-          set -e
-          if [[ -f /env/_master ]]; then
-            set -o allexport
-            source /env/_master
-            set +o allexport
-          fi
-          exec /usr/share/openvswitch/scripts/ovn-ctl run_nb_ovsdb \
-            --no-monitor \
-            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off"
-        lifecycle:
-          postStart:
-            exec:
-              command:
-              - /bin/bash
-              - -c
-              - |
-                retries=0
-                while ! ovn-nbctl -t 5 set-connection ptcp:{{.OVN_NB_PORT}} -- set connection . inactivity_probe=0; do
-                  (( retries += 1 ))
-                  if [[ "${retries}" -gt 40 ]]; then
-                    echo "too many failed ovn-nbctl attempts, giving up"
-                    exit 1
-                  fi
-                  sleep 2
-                done
-        env:
-        - name: OVN_LOG_LEVEL
-          value: info
-        volumeMounts:
-        - mountPath: /etc/openvswitch/
-          name: etc-openvswitch
-        - mountPath: /var/lib/openvswitch/
-          name: var-lib-openvswitch
-        - mountPath: /run/openvswitch/
-          name: run-openvswitch
-        - mountPath: /env
-          name: env-overrides
-        resources:
-          requests:
-            cpu: 100m
-            memory: 300Mi
-
-      # sbdb: the southbound, or flow DB
-      - name: sbdb
-        image: {{.OvnImage}}
-        command:
-        - /bin/bash
-        - -c
-        - |
-          set -e
-          if [[ -f "/env/_master" ]]; then
-            set -o allexport
-            source "/env/_master"
-            set +o allexport
-          fi
-          exec /usr/share/openvswitch/scripts/ovn-ctl run_sb_ovsdb \
-            --no-monitor \
-            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off"
-        env:
-        - name: OVN_LOG_LEVEL
-          value: info
-        lifecycle:
-          postStart:
-            exec:
-              command:
-              - /bin/bash
-              - -c
-              - |
-                retries=0
-                while ! ovn-sbctl -t 5 set-connection ptcp:{{.OVN_SB_PORT}} -- set connection . inactivity_probe=0; do
-                  (( retries += 1 ))
-                  if [[ "${retries}" -gt 40 ]]; then
-                    echo "too many failed ovn-sbctl attempts, giving up"
-                    exit 1
-                  fi
-                  sleep 2
-                done
-        volumeMounts:
-        - mountPath: /etc/openvswitch/
-          name: etc-openvswitch
-        - mountPath: /var/lib/openvswitch/
-          name: var-lib-openvswitch
-        - mountPath: /run/openvswitch/
-          name: run-openvswitch
-        - mountPath: /env
-          name: env-overrides
-
       # ovnkube master: convert kubernetes objects in to nbdb logical network components
       - name: ovnkube-master
         image: {{.OvnImage}}
@@ -176,6 +50,7 @@ spec:
             source "/env/_master"
             set +o allexport
           fi
+          export PATH=$PATH:/usr/share/openvswitch/scripts
           exec /usr/bin/ovnkube \
             --init-master "${K8S_NODE}" \
             --cluster-subnets "${OVN_NET_CIDR}" \
@@ -183,8 +58,10 @@ spec:
             --k8s-apiserver "{{.K8S_APISERVER}}" \
             --ovn-config-namespace openshift-ovn-kubernetes \
             --nodeport \
+            --nb-port {{.OVN_NB_PORT}} \
+            --sb-port {{.OVN_SB_PORT}} \
             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
-            --logfile /dev/stdout
+            --logfile /dev/stdout 
         volumeMounts:
         - mountPath: /etc/openvswitch/
           name: etc-openvswitch
@@ -200,7 +77,7 @@ spec:
             memory: 300Mi
         env:
         - name: OVN_KUBE_LOG_LEVEL
-          value: "4"
+          value: "10"
         - name: OVN_NET_CIDR
           valueFrom:
             configMapKeyRef:

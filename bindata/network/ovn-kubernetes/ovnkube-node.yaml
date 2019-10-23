@@ -179,19 +179,21 @@ spec:
             echo "waiting for db endpoint"
             sleep 5
           done
+          export PATH=$PATH:/usr/share/openvswitch/scripts
           exec /usr/bin/ovnkube --init-node "${K8S_NODE}" \
             --cluster-subnets "${OVN_NET_CIDR}" \
             --k8s-service-cidr "${OVN_SVC_CIDR}" \
             --k8s-apiserver "{{.K8S_APISERVER}}" \
             --ovn-config-namespace ${ovn_config_namespace} \
-            --nb-address "tcp://${db_ip}:{{.OVN_NB_PORT}}" \
-            --sb-address "tcp://${db_ip}:{{.OVN_SB_PORT}}" \
             --nodeport --gateway-mode local \
             --pidfile /var/run/openvswitch/ovnkube-node.pid \
-            --loglevel "${OVN_KUBE_LOG_LEVEL}" --logfile /dev/stdout
+            --nb-port {{.OVN_NB_PORT}} \
+            --sb-port {{.OVN_SB_PORT}} \
+            --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+            --logfile /dev/stdout 
         env:
         - name: OVN_KUBE_LOG_LEVEL
-          value: "4"
+          value: "10"
         # for kubectl
         - name: KUBERNETES_SERVICE_PORT
           value: "{{.KUBERNETES_SERVICE_PORT}}"
