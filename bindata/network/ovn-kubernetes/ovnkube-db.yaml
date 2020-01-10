@@ -1,0 +1,269 @@
+# The ovnkube control-plane components
+
+# The pod disruption budget ensures that we keep a raft quorum
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: ovn-raft-quorum-guard
+  namespace: openshift-ovn-kubernetes
+spec:
+  minAvailable: {{.OVN_MIN_AVAILABLE}}
+  selector:
+    matchLabels:
+      app: ovnkube-db
+
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: ovnkube-db
+  namespace: openshift-ovn-kubernetes
+  annotations:
+    kubernetes.io/description: |
+      This daemonset launches the ovn databases (north and south).
+    release.openshift.io/version: "{{.ReleaseVersion}}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ovnkube-db
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: ovnkube-db
+        component: network
+        type: infra
+        openshift.io/component: network
+        kubernetes.io/os: "linux"
+    spec:
+      serviceAccountName: ovn-kubernetes-controller
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: "system-cluster-critical"
+      # volumes in all containers:
+      # (container) -> (host)
+      # /etc/openvswitch -> /var/lib/ovn/etc - ovsdb data
+      # /var/lib/openvswitch -> /var/lib/ovn/data - ovsdb pki state
+      # /run/openvswitch -> tmpfs - sockets & pids
+      # /env -> configmap env-overrides - debug overrides
+      containers:
+      # nbdb: the northbound, or logical network object DB. In raft mode 
+      - name: nbdb
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -xe
+          if [[ -f /env/_master ]]; then
+            set -o allexport
+            source /env/_master
+            set +o allexport
+          fi
+
+          if [[ "$K8S_NODE" == "{{.OVN_CLUSTER_JOIN_POINT}}" ]]; then
+            exec /usr/share/openvswitch/scripts/ovn-ctl \
+            --db-nb-cluster-local-port={{.OVN_NB_RAFT_PORT}} \
+            --db-nb-cluster-local-addr=${K8S_NODE} \
+            --no-monitor \
+            --db-nb-cluster-local-proto=ssl \
+            --ovn-nb-db-ssl-key=/ovn-cert/tls.key \
+            --ovn-nb-db-ssl-cert=/ovn-cert/tls.crt \
+            --ovn-nb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
+            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
+            run_nb_ovsdb
+          else
+            exec /usr/share/openvswitch/scripts/ovn-ctl \
+            --db-nb-cluster-local-port={{.OVN_NB_RAFT_PORT}} \
+            --db-nb-cluster-remote-port={{.OVN_NB_RAFT_PORT}} \
+            --db-nb-cluster-local-addr=${K8S_NODE} \
+            --db-nb-cluster-remote-addr={{.OVN_CLUSTER_JOIN_POINT}} \
+            --no-monitor \
+            --db-nb-cluster-local-proto=ssl \
+            --db-nb-cluster-remote-proto=ssl \
+            --ovn-nb-db-ssl-key=/ovn-cert/tls.key \
+            --ovn-nb-db-ssl-cert=/ovn-cert/tls.crt \
+            --ovn-nb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
+            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
+            run_nb_ovsdb
+          fi
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - |
+                if [[ "$K8S_NODE" == "{{.OVN_CLUSTER_JOIN_POINT}}" ]]; then
+                  retries=0
+                  while ! ovn-nbctl --no-leader-only -t 5 set-connection pssl:{{.OVN_NB_PORT}} -- set connection . inactivity_probe=0; do
+                    (( retries += 1 ))
+                  if [[ "${retries}" -gt 40 ]]; then
+                    echo "too many failed ovn-nbctl attempts, giving up"
+                      exit 1
+                  fi
+                  sleep 2
+                  done
+                fi
+        readinessProbe:
+          initialDelaySeconds: 30
+          tcpSocket:
+            port: {{.OVN_NB_PORT}}
+        env:
+        - name: OVN_LOG_LEVEL
+          value: info 
+        - name: K8S_NODE
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        resources:
+          requests:
+            cpu: 100m
+            memory: 300Mi
+        ports:
+        - name: nb-db-port
+          containerPort: {{.OVN_NB_PORT}}
+        - name: nb-db-raft-port
+          containerPort: {{.OVN_NB_RAFT_PORT}}
+        terminationMessagePolicy: FallbackToLogsOnError
+      
+      # sbdb: The southbound, or flow DB. In raft mode 
+      - name: sbdb
+        image: "{{.OvnImage}}"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -xe
+          if [[ -f /env/_master ]]; then
+            set -o allexport
+            source /env/_master
+            set +o allexport
+          fi
+
+          if [[ "$K8S_NODE" == "{{.OVN_CLUSTER_JOIN_POINT}}" ]]; then
+            exec /usr/share/openvswitch/scripts/ovn-ctl \
+            --db-sb-cluster-local-port={{.OVN_SB_RAFT_PORT}} \
+            --db-sb-cluster-local-addr=${K8S_NODE} \
+            --no-monitor \
+            --db-sb-cluster-local-proto=ssl \
+            --ovn-sb-db-ssl-key=/ovn-cert/tls.key \
+            --ovn-sb-db-ssl-cert=/ovn-cert/tls.crt \
+            --ovn-sb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
+            --ovn-sb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
+            run_sb_ovsdb
+          else
+            exec /usr/share/openvswitch/scripts/ovn-ctl \
+            --db-sb-cluster-local-port={{.OVN_SB_RAFT_PORT}} \
+            --db-sb-cluster-remote-port={{.OVN_SB_RAFT_PORT}} \
+            --db-sb-cluster-local-addr=${K8S_NODE} \
+            --db-sb-cluster-remote-addr={{.OVN_CLUSTER_JOIN_POINT}} \
+            --no-monitor \
+            --db-sb-cluster-local-proto=ssl \
+            --db-sb-cluster-remote-proto=ssl \
+            --ovn-sb-db-ssl-key=/ovn-cert/tls.key \
+            --ovn-sb-db-ssl-cert=/ovn-cert/tls.crt \
+            --ovn-sb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
+            --ovn-sb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
+            run_sb_ovsdb
+          fi
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - |
+                if [[ "$K8S_NODE" == "{{.OVN_CLUSTER_JOIN_POINT}}" ]]; then
+                  retries=0
+                  while ! ovn-sbctl --no-leader-only -t 5 set-connection pssl:{{.OVN_SB_PORT}} -- set connection . inactivity_probe=0; do
+                    (( retries += 1 ))
+                  if [[ "${retries}" -gt 40 ]]; then
+                    echo "too many failed ovn-sbctl attempts, giving up"
+                      exit 1
+                  fi
+                  sleep 2
+                  done
+                fi
+        readinessProbe:
+          initialDelaySeconds: 30
+          tcpSocket:
+            port: {{.OVN_SB_PORT}}
+        env:
+        - name: OVN_LOG_LEVEL
+          value: info 
+        - name: K8S_NODE
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - mountPath: /etc/openvswitch/
+          name: etc-openvswitch
+        - mountPath: /var/lib/openvswitch/
+          name: var-lib-openvswitch
+        - mountPath: /run/openvswitch/
+          name: run-openvswitch
+        - mountPath: /env
+          name: env-overrides
+        - mountPath: /ovn-cert
+          name: ovn-cert
+        - mountPath: /ovn-ca
+          name: ovn-ca
+        ports:
+        - name: sb-db-port
+          containerPort: {{.OVN_SB_PORT}}
+        - name: sb-db-raft-port
+          containerPort: {{.OVN_SB_RAFT_PORT}}
+        terminationMessagePolicy: FallbackToLogsOnError
+
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+        beta.kubernetes.io/os: "linux"
+      volumes:
+      - name: etc-openvswitch
+        hostPath:
+          path: /var/lib/ovn/etc
+      - name: var-lib-openvswitch
+        hostPath:
+          path: /var/lib/ovn/data
+      - name: run-openvswitch
+        emptyDir: {}
+      - name: env-overrides
+        configMap:
+          name: env-overrides
+          optional: true
+      - name: ovn-ca
+        configMap:
+          name: ovn-ca
+      - name: ovn-cert
+        secret:
+          secretName: ovn-cert
+      tolerations:
+      - key: "node.kubernetes.io/unschedulable"
+        operator: "Exists"
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+      - key: "node.kubernetes.io/network-unavailable"
+        operator: "Exists"

@@ -1,19 +1,4 @@
 # The ovnkube control-plane components
-
-# The pod disruption budget ensures that we keep a raft quorum
-apiVersion: policy/v1beta1
-kind: PodDisruptionBudget
-metadata:
-  name: ovn-raft-quorum-guard
-  namespace: openshift-ovn-kubernetes
-spec:
-  minAvailable: {{.OVN_MIN_AVAILABLE}}
-  selector:
-    matchLabels:
-      app: ovnkube-master
-
----
-
 kind: DaemonSet
 apiVersion: apps/v1
 metadata:
@@ -31,8 +16,6 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      # by default, Deployments spin up the new pod before terminating the old one
-      # but we don't want that - because ovsdb holds the lock.
       maxSurge: 0
       maxUnavailable: 1
   template:
@@ -46,7 +29,12 @@ spec:
     spec:
       serviceAccountName: ovn-kubernetes-controller
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: "system-cluster-critical"
+      hostAliases:
+      - ip: "{{.OVN_CLUSTER_JOIN_POINT}}"
+        hostnames:
+        - "ovnkube-db.openshift-ovn-kubernetes.svc.cluster.local"
       # volumes in all containers:
       # (container) -> (host)
       # /etc/openvswitch -> /var/lib/ovn/etc - ovsdb data
@@ -68,32 +56,26 @@ spec:
             set +o allexport
           fi
 
-          OVN_NODES_ARRAY=({{.OVN_NODES}})
-          
-          nb_addr_list=""
-          sb_addr_list=""
-          
-          for i in "${!OVN_NODES_ARRAY[@]}"; do
-            if [[ $i != 0 ]]; then
-              nb_addr_list="${nb_addr_list},"
-              sb_addr_list="${sb_addr_list},"
-            fi
-            host=$(getent ahostsv4 "${OVN_NODES_ARRAY[$i]}" | grep RAW | awk '{print $1}')
-            nb_addr_list="${nb_addr_list}ssl:${host}:{{.OVN_NB_PORT}}"
-            sb_addr_list="${sb_addr_list}ssl:${host}:{{.OVN_SB_PORT}}"
-          done
-          
+          # Perform DNS resolution against the DNS resolver first and /etc/hosts second
+          sed -i 's/hosts:      files dns myhostname/hosts:      dns files myhostname/g' /etc/nsswitch.conf
+
           exec ovn-northd \
             --no-chdir "-vconsole:${OVN_LOG_LEVEL}" -vfile:off \
             --pidfile=/var/run/openvswitch/ovn-northd.pid \
-            --ovnnb-db "${nb_addr_list}" \
-            --ovnsb-db "${sb_addr_list}" \
+            --ovnnb-db ssl:${OVN_DB_SVC_NAME}.${OVN_NAMESPACE}.svc.cluster.local:{{.OVN_NB_PORT}} \
+            --ovnsb-db ssl:${OVN_DB_SVC_NAME}.${OVN_NAMESPACE}.svc.cluster.local:{{.OVN_SB_PORT}} \
             -p /ovn-cert/tls.key \
             -c /ovn-cert/tls.crt \
             -C /ovn-ca/ca-bundle.crt 
         env:
         - name: OVN_LOG_LEVEL
           value: info 
+        - name: OVN_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OVN_DB_SVC_NAME
+          value: "ovnkube-db"
         volumeMounts:
         - mountPath: /etc/openvswitch/
           name: etc-openvswitch
@@ -113,199 +95,6 @@ spec:
             memory: 300Mi
         terminationMessagePolicy: FallbackToLogsOnError
 
-      # nbdb: the northbound, or logical network object DB. In raft mode 
-      - name: nbdb
-        image: "{{.OvnImage}}"
-        command:
-        - /bin/bash
-        - -c
-        - |
-          set -xe
-          if [[ -f /env/_master ]]; then
-            set -o allexport
-            source /env/_master
-            set +o allexport
-          fi
-          
-          OVN_NODES_ARRAY=({{.OVN_NODES}})
-          MASTER_NODE=$(getent ahostsv4 "${OVN_NODES_ARRAY[0]}" | grep RAW | awk '{print $1}')
-          LOCALHOST=$(getent ahostsv4 "${K8S_NODE}" | grep RAW | awk '{print $1}')
-
-          if [[ "$LOCALHOST" == "$MASTER_NODE" ]]; then
-            exec /usr/share/openvswitch/scripts/ovn-ctl \
-            --db-nb-cluster-local-port={{.OVN_NB_RAFT_PORT}} \
-            --db-nb-cluster-local-addr=${LOCALHOST} \
-            --no-monitor \
-            --db-nb-cluster-local-proto=ssl \
-            --ovn-nb-db-ssl-key=/ovn-cert/tls.key \
-            --ovn-nb-db-ssl-cert=/ovn-cert/tls.crt \
-            --ovn-nb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
-            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
-            run_nb_ovsdb
-          else
-            exec /usr/share/openvswitch/scripts/ovn-ctl \
-            --db-nb-cluster-local-port={{.OVN_NB_RAFT_PORT}} \
-            --db-nb-cluster-remote-port={{.OVN_NB_RAFT_PORT}} \
-            --db-nb-cluster-local-addr=${LOCALHOST} \
-            --db-nb-cluster-remote-addr=${MASTER_NODE} \
-            --no-monitor \
-            --db-nb-cluster-local-proto=ssl \
-            --db-nb-cluster-remote-proto=ssl \
-            --ovn-nb-db-ssl-key=/ovn-cert/tls.key \
-            --ovn-nb-db-ssl-cert=/ovn-cert/tls.crt \
-            --ovn-nb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
-            --ovn-nb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
-            run_nb_ovsdb
-          fi
-        lifecycle:
-          postStart:
-            exec:
-              command:
-              - /bin/bash
-              - -c
-              - |
-                OVN_NODES_ARRAY=({{.OVN_NODES}})
-                if [[ "$K8S_NODE" == "${OVN_NODES_ARRAY[0]}" ]]; then
-                  retries=0
-                  while ! ovn-nbctl --no-leader-only -t 5 set-connection pssl:{{.OVN_NB_PORT}} -- set connection . inactivity_probe=0; do
-                    (( retries += 1 ))
-                  if [[ "${retries}" -gt 40 ]]; then
-                    echo "too many failed ovn-nbctl attempts, giving up"
-                      exit 1
-                  fi
-                  sleep 2
-                  done
-                fi
-        readinessProbe:
-          initialDelaySeconds: 30
-          tcpSocket:
-            port: {{.OVN_NB_PORT}}
-        env:
-        - name: OVN_LOG_LEVEL
-          value: info 
-        - name: K8S_NODE
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        volumeMounts:
-        - mountPath: /etc/openvswitch/
-          name: etc-openvswitch
-        - mountPath: /var/lib/openvswitch/
-          name: var-lib-openvswitch
-        - mountPath: /run/openvswitch/
-          name: run-openvswitch
-        - mountPath: /env
-          name: env-overrides
-        - mountPath: /ovn-cert
-          name: ovn-cert
-        - mountPath: /ovn-ca
-          name: ovn-ca
-        resources:
-          requests:
-            cpu: 100m
-            memory: 300Mi
-        ports:
-        - name: nb-db-port
-          containerPort: {{.OVN_NB_PORT}}
-        - name: nb-db-raft-port
-          containerPort: {{.OVN_NB_RAFT_PORT}}
-        terminationMessagePolicy: FallbackToLogsOnError
-      
-      # sbdb: The southbound, or flow DB. In raft mode 
-      - name: sbdb
-        image: "{{.OvnImage}}"
-        command:
-        - /bin/bash
-        - -c
-        - |
-          set -xe
-          if [[ -f /env/_master ]]; then
-            set -o allexport
-            source /env/_master
-            set +o allexport
-          fi
-
-          OVN_NODES_ARRAY=({{.OVN_NODES}})
-          MASTER_NODE=$(getent ahostsv4 "${OVN_NODES_ARRAY[0]}" | grep RAW | awk '{print $1}')
-          LOCALHOST=$(getent ahostsv4 "${K8S_NODE}" | grep RAW | awk '{print $1}')
-
-          if [[ "$LOCALHOST" == "$MASTER_NODE" ]]; then
-            exec /usr/share/openvswitch/scripts/ovn-ctl \
-            --db-sb-cluster-local-port={{.OVN_SB_RAFT_PORT}} \
-            --db-sb-cluster-local-addr=${LOCALHOST} \
-            --no-monitor \
-            --db-sb-cluster-local-proto=ssl \
-            --ovn-sb-db-ssl-key=/ovn-cert/tls.key \
-            --ovn-sb-db-ssl-cert=/ovn-cert/tls.crt \
-            --ovn-sb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
-            --ovn-sb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
-            run_sb_ovsdb
-          else
-            echo "joining cluster at ${OVN_NODES_ARRAY[0]}"
-            exec /usr/share/openvswitch/scripts/ovn-ctl \
-            --db-sb-cluster-local-port={{.OVN_SB_RAFT_PORT}} \
-            --db-sb-cluster-remote-port={{.OVN_SB_RAFT_PORT}} \
-            --db-sb-cluster-local-addr=${LOCALHOST} \
-            --db-sb-cluster-remote-addr=${MASTER_NODE} \
-            --no-monitor \
-            --db-sb-cluster-local-proto=ssl \
-            --db-sb-cluster-remote-proto=ssl \
-            --ovn-sb-db-ssl-key=/ovn-cert/tls.key \
-            --ovn-sb-db-ssl-cert=/ovn-cert/tls.crt \
-            --ovn-sb-db-ssl-ca-cert=/ovn-ca/ca-bundle.crt \
-            --ovn-sb-log="-vconsole:${OVN_LOG_LEVEL} -vfile:off" \
-            run_sb_ovsdb
-          fi
-        lifecycle:
-          postStart:
-            exec:
-              command:
-              - /bin/bash
-              - -c
-              - |
-                OVN_NODES_ARRAY=({{.OVN_NODES}})
-                if [[ "$K8S_NODE" == "${OVN_NODES_ARRAY[0]}" ]]; then
-                  retries=0
-                  while ! ovn-sbctl --no-leader-only -t 5 set-connection pssl:{{.OVN_SB_PORT}} -- set connection . inactivity_probe=0; do
-                    (( retries += 1 ))
-                  if [[ "${retries}" -gt 40 ]]; then
-                    echo "too many failed ovn-sbctl attempts, giving up"
-                      exit 1
-                  fi
-                  sleep 2
-                  done
-                fi
-        readinessProbe:
-          initialDelaySeconds: 30
-          tcpSocket:
-            port: {{.OVN_SB_PORT}}
-        env:
-        - name: OVN_LOG_LEVEL
-          value: info 
-        - name: K8S_NODE
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        volumeMounts:
-        - mountPath: /etc/openvswitch/
-          name: etc-openvswitch
-        - mountPath: /var/lib/openvswitch/
-          name: var-lib-openvswitch
-        - mountPath: /run/openvswitch/
-          name: run-openvswitch
-        - mountPath: /env
-          name: env-overrides
-        - mountPath: /ovn-cert
-          name: ovn-cert
-        - mountPath: /ovn-ca
-          name: ovn-ca
-        ports:
-        - name: sb-db-port
-          containerPort: {{.OVN_SB_PORT}}
-        - name: sb-db-raft-port
-          containerPort: {{.OVN_SB_RAFT_PORT}}
-        terminationMessagePolicy: FallbackToLogsOnError
-
       # ovnkube master: convert kubernetes objects in to nbdb logical network components
       - name: ovnkube-master
         image: "{{.OvnImage}}"
@@ -319,6 +108,9 @@ spec:
             source "/env/_master"
             set +o allexport
           fi
+          
+          # Perform DNS resolution against the DNS resolver first and /etc/hosts second
+          sed -i 's/hosts:      files dns myhostname/hosts:      dns files myhostname/g' /etc/nsswitch.conf
 
           hybrid_overlay_flags=
           if [[ -n "{{.OVNHybridOverlayEnable }}" ]]; then
@@ -328,24 +120,11 @@ spec:
             fi
           fi
 
-          OVN_NODES_ARRAY=({{.OVN_NODES}})
-          nb_addr_list=""
-          sb_addr_list=""
-          for i in "${!OVN_NODES_ARRAY[@]}"; do
-            if [[ $i != 0 ]]; then
-              nb_addr_list="${nb_addr_list},"
-              sb_addr_list="${sb_addr_list},"
-            fi
-            host=$(getent ahostsv4 "${OVN_NODES_ARRAY[$i]}" | grep RAW | awk '{print $1}')
-            nb_addr_list="${nb_addr_list}ssl:${host}:{{.OVN_NB_PORT}}"
-            sb_addr_list="${sb_addr_list}ssl://${host}:{{.OVN_SB_PORT}}"
-          done
-          
           # start nbctl daemon for caching
           export OVN_NB_DAEMON=$(ovn-nbctl --pidfile=/run/openvswitch/ovnk-nbctl.pid \
             --detach \
             -p /ovn-cert/tls.key -c /ovn-cert/tls.crt -C /ovn-ca/ca-bundle.crt \
-            --db "${nb_addr_list}")
+            --db ssl:${OVN_DB_SVC_NAME}.${OVN_NAMEPSACE}.svc.cluster.local:{{.OVN_NB_PORT}})
 
           exec /usr/bin/ovnkube \
             --init-master "${K8S_NODE}" \
@@ -354,7 +133,7 @@ spec:
             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
             ${hybrid_overlay_flags} \
             --metrics-bind-address "0.0.0.0:9102" \
-            --sb-address "${sb_addr_list}" \
+            --sb-address ssl://${OVN_DB_SVC_NAME}.${OVN_NAMESPACE}.svc.cluster.local:{{.OVN_SB_PORT}} \
             --sb-client-privkey /ovn-cert/tls.key \
             --sb-client-cert /ovn-cert/tls.crt \
             --sb-client-cacert /ovn-ca/ca-bundle.crt
@@ -388,6 +167,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: OVN_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OVN_DB_SVC_NAME
+          value: "ovnkube-db"
         - name: OVN_HYBRID_OVERLAY_ENABLE
           value: "{{ .OVNHybridOverlayEnable }}"
         - name: OVN_HYBRID_OVERLAY_NET_CIDR
@@ -428,6 +213,8 @@ spec:
       - key: "node.kubernetes.io/not-ready"
         operator: "Exists"
       - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+      - key: "node.kubernetes.io/unschedulable"
         operator: "Exists"
       - key: "node.kubernetes.io/network-unavailable"
         operator: "Exists"

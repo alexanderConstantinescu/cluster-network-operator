@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strings"
 
 	"github.com/pkg/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -23,6 +22,8 @@ const OVN_NB_PORT = "9641"
 const OVN_SB_PORT = "9642"
 const OVN_NB_RAFT_PORT = "9643"
 const OVN_SB_RAFT_PORT = "9644"
+
+var CLUSTER_JOIN_POINT string
 
 // renderOVNKubernetes returns the manifests for the ovn-kubernetes.
 // This creates
@@ -51,7 +52,7 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	data.Data["OVN_SB_PORT"] = OVN_SB_PORT
 	data.Data["OVN_NB_RAFT_PORT"] = OVN_NB_RAFT_PORT
 	data.Data["OVN_SB_RAFT_PORT"] = OVN_SB_RAFT_PORT
-	data.Data["OVN_NODES"] = strings.Join(bootstrapResult.OVN.OVNMasterNodes, " ")
+	data.Data["OVN_CLUSTER_JOIN_POINT"] = bootstrapResult.OVN.OVNClusterJoinPoint
 	data.Data["OVN_MIN_AVAILABLE"] = len(bootstrapResult.OVN.OVNMasterNodes)/2 + 1
 
 	var ippools string
@@ -177,14 +178,24 @@ func boostrapOVN(kubeClient client.Client) (*bootstrap.BootstrapResult, error) {
 
 	ovnMasterNodes := []string{}
 	for _, masterNode := range masterNodeList.Items {
-		ovnMasterNodes = append(ovnMasterNodes, masterNode.Name)
+		for _, address := range masterNode.Status.Addresses {
+			if address.Type == corev1.NodeInternalIP {
+				ovnMasterNodes = append(ovnMasterNodes, address.Address)
+				break
+			}
+		}
 	}
 
 	sort.Strings(ovnMasterNodes)
 
+	if CLUSTER_JOIN_POINT == "" {
+		CLUSTER_JOIN_POINT = ovnMasterNodes[0]
+	}
+
 	res := bootstrap.BootstrapResult{
 		OVN: bootstrap.OVNBootstrapResult{
-			OVNMasterNodes: ovnMasterNodes,
+			OVNMasterNodes:      ovnMasterNodes,
+			OVNClusterJoinPoint: CLUSTER_JOIN_POINT,
 		},
 	}
 	return &res, nil

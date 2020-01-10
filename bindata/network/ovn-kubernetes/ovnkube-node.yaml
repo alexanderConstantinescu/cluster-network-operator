@@ -24,8 +24,13 @@ spec:
     spec:
       serviceAccountName: ovn-kubernetes-node
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       hostPID: true
       priorityClassName: "system-node-critical"
+      hostAliases:
+      - ip: "{{.OVN_CLUSTER_JOIN_POINT}}"
+        hostnames:
+        - "ovnkube-db.openshift-ovn-kubernetes.svc.cluster.local"
       # volumes in all containers:
       # (container) -> (host)
       # /etc/openvswitch -> /var/lib/openvswitch/etc - ovsdb system id
@@ -91,21 +96,24 @@ spec:
             source "/env/${K8S_NODE}"
             set +o allexport
           fi
+          
+          # Perform DNS resolution against the DNS resolver first and /etc/hosts second
+          sed -i 's/hosts:      files dns myhostname/hosts:      dns files myhostname/g' /etc/nsswitch.conf
           cp -f /usr/libexec/cni/ovn-k8s-cni-overlay /cni-bin-dir/
-          ovn_config_namespace=openshift-ovn-kubernetes
-          retries=0
-          while true; do
-            db_ip=$(kubectl get ep -n ${ovn_config_namespace} ovnkube-db -o jsonpath='{.subsets[0].addresses[0].ip}')
-            if [[ -n "${db_ip}" ]]; then
-              break
-            fi
-            (( retries += 1 ))
-            if [[ "${retries}" -gt 40 ]]; then
-              echo "db endpoint never came up"
-              exit 1
-            fi
-            echo "waiting for db endpoint"
-            sleep 5
+
+          retries=0	
+          while true; do	
+            db_ip=$(kubectl get ep -n ${OVN_NAMESPACE} ${OVN_DB_SVC_NAME} -o jsonpath='{.subsets[0].addresses[0].ip}')	
+            if [[ -n "${db_ip}" ]]; then	
+              break	
+            fi	
+            (( retries += 1 ))	
+            if [[ "${retries}" -gt 40 ]]; then	
+              echo "db endpoint never came up"	
+              exit 1	
+            fi	
+            echo "waiting for db endpoint"	
+            sleep 5	
           done
 
           hybrid_overlay_flags=
@@ -115,27 +123,14 @@ spec:
               hybrid_overlay_flags="${hybrid_overlay_flags} --hybrid-overlay-cluster-subnets={{.OVNHybridOverlayNetCIDR}}"
             fi
           fi
-          
-          OVN_NODES_ARRAY=({{.OVN_NODES}})
-          nb_addr_list=""
-          sb_addr_list=""
-          for i in "${!OVN_NODES_ARRAY[@]}"; do
-            if [[ $i != 0 ]]; then
-              nb_addr_list="${nb_addr_list},"
-              sb_addr_list="${sb_addr_list},"
-            fi
-            host=$(getent ahostsv4 "${OVN_NODES_ARRAY[$i]}" | grep RAW | awk '{print $1}')
-            nb_addr_list="${nb_addr_list}ssl://${host}:{{.OVN_NB_PORT}}"
-            sb_addr_list="${sb_addr_list}ssl://${host}:{{.OVN_SB_PORT}}"
-          done
 
           exec /usr/bin/ovnkube --init-node "${K8S_NODE}" \
             --cluster-subnets "${OVN_NET_CIDR}" \
             --k8s-service-cidr "${OVN_SVC_CIDR}" \
             --k8s-apiserver "{{.K8S_APISERVER}}" \
-            --ovn-config-namespace ${ovn_config_namespace} \
-            --nb-address "${nb_addr_list}" \
-            --sb-address "${sb_addr_list}" \
+            --ovn-config-namespace ${OVN_NAMESPACE} \
+            --nb-address ssl://${OVN_DB_SVC_NAME}.${OVN_NAMESPACE}.svc.cluster.local:{{.OVN_NB_PORT}} \
+            --sb-address ssl://${OVN_DB_SVC_NAME}.${OVN_NAMESPACE}.svc.cluster.local:{{.OVN_SB_PORT}} \
             --nb-client-privkey /ovn-cert/tls.key \
             --nb-client-cert /ovn-cert/tls.crt \
             --nb-client-cacert /ovn-ca/ca-bundle.crt \
@@ -163,6 +158,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: OVN_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OVN_DB_SVC_NAME
+          value: "ovnkube-db"
         ports:
         - name: metrics-port
           containerPort: 9101
