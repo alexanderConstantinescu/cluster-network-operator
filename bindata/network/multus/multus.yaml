@@ -78,4 +78,4 @@ spec:
             path: {{ .MultusCNIConfDir }}
         - name: cnibin
           hostPath:
-            path: /var/lib/cni/bin
+            path: {{ .CNIBinDir }}
