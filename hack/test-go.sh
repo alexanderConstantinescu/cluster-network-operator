@@ -1,5 +1,6 @@
 #!/bin/bash
 
+
 source "$(dirname "${BASH_SOURCE}")/init.sh"
 
 # Check for `go` binary and set ${GOPATH}.
